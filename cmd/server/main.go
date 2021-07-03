@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"flag"
@@ -45,23 +46,13 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/songs", http.HandlerFunc(app.songsHandler))
+	mux.Handle("/songs/list", app.listSongsHandler())
+	mux.Handle("/songs/create", app.idempotencyAPI(app.createSongHandler))
 
 	addr := fmt.Sprintf(":%d", port)
 	fmt.Println("server listen on", addr)
 	if err := http.ListenAndServe(addr, logger(mux)); err != nil {
 		panic(err)
-	}
-}
-
-func (app *application) songsHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		app.getSongs(w, r)
-	case http.MethodPost:
-		app.createSong(w, r)
-	default:
-		app.responseError(w, r, "", http.StatusMethodNotAllowed, false)
 	}
 }
 
@@ -72,55 +63,48 @@ type song struct {
 	Year   int
 }
 
-func (app *application) getSongs(w http.ResponseWriter, r *http.Request) {
-	rows, err := app.db.Query("SELECT * FROM songs")
-	if err != nil {
-		panic(err)
-	}
-
-	ss := []*song{}
-	for rows.Next() {
-		s := &song{}
-		err = rows.Scan(&s.ID, &s.Title, &s.Artist, &s.Year)
+func (app *application) listSongsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rows, err := app.db.Query("SELECT * FROM songs")
 		if err != nil {
-			fmt.Println(err)
-			app.responseError(w, r, "", http.StatusInternalServerError, false)
+			panic(err)
+		}
+
+		ss := []*song{}
+		for rows.Next() {
+			s := &song{}
+			err = rows.Scan(&s.ID, &s.Title, &s.Artist, &s.Year)
+			if err != nil {
+				fmt.Println(err)
+				app.responseError(w, r, "", http.StatusInternalServerError)
+				return
+			}
+			ss = append(ss, s)
+		}
+
+		if err = rows.Err(); err != nil {
+			panic(err)
+		}
+
+		err = app.writeJson(w, r, http.StatusOK, ss)
+		if err != nil {
+			app.responseError(w, r, "", http.StatusInternalServerError)
 			return
 		}
-		ss = append(ss, s)
-	}
-
-	if err = rows.Err(); err != nil {
-		panic(err)
-	}
-
-	err = app.writeJson(w, r, http.StatusOK, ss, false)
-	if err != nil {
-		app.responseError(w, r, "", http.StatusInternalServerError, false)
-		return
-	}
+	})
 }
 
-func (app *application) createSong(w http.ResponseWriter, r *http.Request) {
-	done, err := app.beforeIdempotencyAPI(w, r)
-	if err != nil {
-		app.responseError(w, r, err.Error(), http.StatusInternalServerError, false)
-		return
-	}
-	if done {
-		return
-	}
-
+func (app *application) createSongHandler(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Title  string
 		Artist string
 		Year   int
 	}
 
-	err = json.NewDecoder(r.Body).Decode(&input)
+	err := json.NewDecoder(r.Body).Decode(&input)
 	if err != nil {
 		fmt.Println(err)
-		app.responseError(w, r, "", http.StatusBadRequest, true)
+		app.responseError(w, r, "", http.StatusBadRequest)
 		return
 	}
 
@@ -129,7 +113,7 @@ func (app *application) createSong(w http.ResponseWriter, r *http.Request) {
 	err = app.db.QueryRow(stmt, input.Title, input.Artist, input.Year).Scan(&id)
 	if err != nil {
 		fmt.Println(err)
-		app.responseError(w, r, "", http.StatusInternalServerError, true)
+		app.responseError(w, r, "", http.StatusInternalServerError)
 		return
 	}
 
@@ -138,19 +122,19 @@ func (app *application) createSong(w http.ResponseWriter, r *http.Request) {
 	err = app.db.QueryRow(stmt, id).Scan(&s.ID, &s.Title, &s.Artist, &s.Year)
 	if err != nil {
 		fmt.Println(err)
-		app.responseError(w, r, "", http.StatusInternalServerError, true)
+		app.responseError(w, r, "", http.StatusInternalServerError)
 		return
 	}
 
-	err = app.writeJson(w, r, http.StatusCreated, s, true)
+	err = app.writeJson(w, r, http.StatusCreated, s)
 	if err != nil {
 		fmt.Println(err)
-		app.responseError(w, r, "", http.StatusInternalServerError, true)
+		app.responseError(w, r, "", http.StatusInternalServerError)
 		return
 	}
 }
 
-func (app *application) writeJson(w http.ResponseWriter, r *http.Request, status int, data interface{}, idempotency bool) error {
+func (app *application) writeJson(w http.ResponseWriter, r *http.Request, status int, data interface{}) error {
 	js, err := json.Marshal(data)
 	if err != nil {
 		return err
@@ -161,10 +145,6 @@ func (app *application) writeJson(w http.ResponseWriter, r *http.Request, status
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	w.Write(js)
-
-	if idempotency {
-		app.afterIdempotencyAPI(r, w.Header(), status, js)
-	}
 	return nil
 }
 
@@ -173,56 +153,6 @@ type Response struct {
 	Header http.Header
 	Status int
 	Body   []byte
-}
-
-func (app *application) beforeIdempotencyAPI(w http.ResponseWriter, r *http.Request) (bool, error) {
-	ik := r.Header.Get("Idempotency-Key")
-	if ik == "" {
-		app.responseError(w, r, "missing header: Idempotency-Key", http.StatusBadRequest, false)
-		return true, nil
-	}
-
-	v, ok := app.ikCache.Get(ik)
-	if !ok {
-		app.ikCache.Set(ik, &Response{}, cache.DefaultExpiration)
-		dump(app.ikCache)
-		return false, nil
-	}
-
-	resp := v.(*Response)
-	for !resp.Ready {
-		v, ok := app.ikCache.Get(ik)
-		if !ok {
-			app.responseError(w, r, "", http.StatusInternalServerError, false)
-			return true, nil
-		}
-		resp = v.(*Response)
-		time.Sleep(45 * time.Millisecond)
-	}
-
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.Status)
-	if resp.Body != nil {
-		w.Write(resp.Body)
-	}
-	return true, nil
-}
-
-func (app *application) afterIdempotencyAPI(r *http.Request, header http.Header, status int, body []byte) error {
-	ik := r.Header.Get("Idempotency-Key")
-	if ik == "" {
-		return fmt.Errorf(http.StatusText(http.StatusInternalServerError))
-	}
-
-	app.ikCache.Replace(ik,
-		&Response{Ready: true, Header: header, Status: status, Body: body},
-		cache.DefaultExpiration,
-	)
-
-	dump(app.ikCache)
-	return nil
 }
 
 func dump(c *cache.Cache) {
@@ -237,13 +167,72 @@ func logger(next http.Handler) http.Handler {
 	})
 }
 
-func (app *application) responseError(w http.ResponseWriter, r *http.Request, msg string, status int, idempotency bool) {
+func (app *application) responseError(w http.ResponseWriter, r *http.Request, msg string, status int) {
 	if msg == "" {
 		http.StatusText(status)
 	}
 	http.Error(w, msg, status)
+}
 
-	if idempotency {
-		app.afterIdempotencyAPI(r, w.Header(), status, nil)
-	}
+type idempotencyWriter struct {
+	http.ResponseWriter
+	body       *bytes.Buffer
+	statusCode int
+}
+
+func (w *idempotencyWriter) WriteHeader(code int) {
+	fmt.Printf("WriteHeader code: %d\n", code)
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *idempotencyWriter) Write(p []byte) (n int, err error) {
+	fmt.Printf("Write p: %s\n", string(p))
+	w.body.Write(p)
+	return w.ResponseWriter.Write(p)
+}
+
+func (app *application) idempotencyAPI(api http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ik := r.Header.Get("Idempotency-Key")
+		if ik == "" {
+			app.responseError(w, r, "missing header: Idempotency-Key", http.StatusBadRequest)
+			return
+		}
+
+		v, ok := app.ikCache.Get(ik)
+		if ok {
+			resp := v.(*Response)
+			for !resp.Ready {
+				v, ok := app.ikCache.Get(ik)
+				if !ok {
+					app.responseError(w, r, "", http.StatusInternalServerError)
+					return
+				}
+				resp = v.(*Response)
+				time.Sleep(45 * time.Millisecond)
+			}
+
+			for k, v := range resp.Header {
+				w.Header()[k] = v
+			}
+			w.WriteHeader(resp.Status)
+			if resp.Body != nil {
+				w.Write(resp.Body)
+			}
+			return
+		}
+
+		app.ikCache.Set(ik, &Response{}, cache.DefaultExpiration)
+		dump(app.ikCache)
+
+		iw := &idempotencyWriter{w, &bytes.Buffer{}, http.StatusOK}
+		api(iw, r)
+
+		app.ikCache.Replace(ik,
+			&Response{Ready: true, Header: iw.Header(), Status: iw.statusCode, Body: iw.body.Bytes()},
+			cache.DefaultExpiration,
+		)
+		dump(app.ikCache)
+	})
 }
