@@ -21,7 +21,6 @@ var (
 
 type application struct {
 	db *sql.DB
-	//ikCache *cache.Cache
 }
 
 func main() {
@@ -42,7 +41,6 @@ func main() {
 
 	app := &application{
 		db: db,
-		//ikCache: cache.New(10*time.Second, time.Minute),
 	}
 
 	mux := http.NewServeMux()
