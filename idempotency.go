@@ -15,7 +15,7 @@ func API(handler http.HandlerFunc) http.Handler {
 	return APIWithExiprationConfig(handler, 30*time.Second, 1*time.Minute)
 }
 
-func APIWithExiprationConfig(handler http.HandlerFunc, ikExpiration, cleanupInterval time.Duration) http.Handler {
+func APIWithConfig(handler http.HandlerFunc, ikExpiration, cleanupInterval time.Duration) http.Handler {
 	return &IdempotencyAPI{
 		ikCache: cache.New(ikExpiration, cleanupInterval),
 		handler: handler,
