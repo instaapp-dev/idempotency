@@ -19,9 +19,9 @@ Idempotency-Key: 18c691197e040223aa72bf63c85fa65441d2ac6772f0d04f6cde9619a7c1b50
 On server side, wrap API handler with middleware like this:
 
 ```go
-	mux := http.NewServeMux()
-	mux.Handle("/songs/create", idempotency.API(createSongHandler))
-	http.ListenAndServe(":4000", mux)
+mux := http.NewServeMux()
+mux.Handle("/songs/create", idempotency.API(createSongHandler))
+http.ListenAndServe(":4000", mux)
 ```
 
 It creates memory cache ([go-cache](https://github.com/patrickmn/go-cache)) for this API, which map from idempotency key (IK) to response (including status code, headers, and response body).
