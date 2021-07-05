@@ -11,14 +11,21 @@ import (
 	"github.com/patrickmn/go-cache"
 )
 
+const (
+	DefExpiration      = 30 * time.Second
+	DefCleanupInterval = 1 * time.Minute
+	DefMinIKLength     = 32
+)
+
 func API(handler http.HandlerFunc) http.Handler {
-	return APIWithExiprationConfig(handler, 30*time.Second, 1*time.Minute)
+	return APIWithConfig(handler, DefExpiration, DefCleanupInterval, DefMinIKLength)
 }
 
-func APIWithConfig(handler http.HandlerFunc, ikExpiration, cleanupInterval time.Duration) http.Handler {
+func APIWithConfig(handler http.HandlerFunc, expiration, cleanupInterval time.Duration, minIKLen int) http.Handler {
 	return &IdempotencyAPI{
-		ikCache: cache.New(ikExpiration, cleanupInterval),
-		handler: handler,
+		ikCache:  cache.New(expiration, cleanupInterval),
+		handler:  handler,
+		minIKLen: minIKLen,
 	}
 }
 
@@ -39,8 +46,9 @@ func (rc *respCatcher) Write(p []byte) (n int, err error) {
 }
 
 type IdempotencyAPI struct {
-	ikCache *cache.Cache
-	handler http.HandlerFunc
+	ikCache  *cache.Cache
+	handler  http.HandlerFunc
+	minIKLen int
 }
 
 func (i *IdempotencyAPI) responseError(w http.ResponseWriter, r *http.Request, msg string, status int) {
@@ -82,6 +90,10 @@ func (i *IdempotencyAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		i.responseError(w, r, "missing header: Idempotency-Key", http.StatusBadRequest)
 		return
 	}
+	if len(ik) < i.minIKLen {
+		i.responseError(w, r, fmt.Sprintf("Minimum idempotency key length: %d", i.minIKLen), http.StatusBadRequest)
+		return
+	}
 
 	err := i.ikCache.Add(ik, &response{}, cache.DefaultExpiration)
 	if err != nil {
@@ -100,7 +112,6 @@ func (i *IdempotencyAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		i.dump("sending cached response")
 
 		for k, v := range resp.Header {
 			w.Header()[k] = v
@@ -112,7 +123,6 @@ func (i *IdempotencyAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	i.dump("before api")
 	respWriter := &respCatcher{w, &bytes.Buffer{}, http.StatusOK}
 	i.handler(respWriter, r)
 
@@ -120,5 +130,4 @@ func (i *IdempotencyAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		&response{Ready: true, Header: respWriter.Header(), Status: respWriter.statusCode, Body: respWriter.body.Bytes()},
 		cache.DefaultExpiration,
 	)
-	i.dump("after api")
 }
